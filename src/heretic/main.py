@@ -39,13 +39,14 @@ import logging
 import math
 import os
 import random
+import re
 import time
 import warnings
 from dataclasses import asdict
 from importlib.metadata import version
 from os.path import commonprefix
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import huggingface_hub
 import lm_eval
@@ -62,11 +63,12 @@ from optuna.exceptions import ExperimentalWarning
 from optuna.samplers import TPESampler
 from optuna.storages import JournalStorage
 from optuna.storages.journal import JournalFileBackend, JournalFileOpenLock
-from optuna.study import StudyDirection
-from optuna.trial import TrialState, create_trial
+from optuna.trial import FrozenTrial, TrialState, create_trial
 from pydantic import ValidationError
 from questionary import Choice, Style
+from rich.markup import escape
 from rich.table import Table
+from rich.text import Text
 from rich.traceback import install
 
 from .analyzer import Analyzer
@@ -80,6 +82,7 @@ from .reproduce import (
 )
 from .system import empty_cache, get_accelerator_info
 from .utils import (
+    ask_if_unset,
     format_duration,
     format_exception,
     get_file_sha256,
@@ -89,11 +92,6 @@ from .utils import (
     load_prompts,
     print,
     print_memory_usage,
-    prompt_password,
-    prompt_path,
-    prompt_select,
-    prompt_text,
-    set_seed,
     upload_reproduce_folder,
 )
 
@@ -108,10 +106,10 @@ def obtain_export_strategy(
     Returns an export strategy, or None if cancelled.
     """
 
-    if settings.export_strategy is not None:
-        return settings.export_strategy
-
-    if settings.quantization == QuantizationMethod.BNB_4BIT:
+    if (
+        settings.quantization == QuantizationMethod.BNB_4BIT
+        and settings.export_strategy is None
+    ):
         print()
         print(
             "The model was loaded with quantization. Merging requires reloading the base model."
@@ -155,26 +153,28 @@ def obtain_export_strategy(
 
         print()
 
-    strategy = prompt_select(
-        "How do you want to export the model?",
-        choices=[
-            Choice(
-                title="Merge the abliteration LoRA and export the full model"
-                + (
-                    ""
-                    if settings.quantization == QuantizationMethod.NONE
-                    else " (requires sufficient RAM)"
+    return ask_if_unset(
+        settings.export_strategy,
+        questionary.select(
+            "How do you want to export the model?",
+            choices=[
+                Choice(
+                    title="Merge the abliteration LoRA and export the full model"
+                    + (
+                        ""
+                        if settings.quantization == QuantizationMethod.NONE
+                        else " (requires sufficient RAM)"
+                    ),
+                    value=ExportStrategy.MERGE,
                 ),
-                value=ExportStrategy.MERGE,
-            ),
-            Choice(
-                title="Export the abliteration LoRA only (can be merged later)",
-                value=ExportStrategy.ADAPTER,
-            ),
-        ],
+                Choice(
+                    title="Export the abliteration LoRA only (can be merged later)",
+                    value=ExportStrategy.ADAPTER,
+                ),
+            ],
+            style=Style([("highlighted", "reverse")]),
+        ),
     )
-
-    return strategy
 
 
 def run():
@@ -245,30 +245,46 @@ def run():
         # FIXME: "Reproduction"/"reproducibility" name inconsistency!
         reproduction_information = load_reproduction_information(settings.reproduce)
 
-        if reproduction_information["version"] not in ["1", "2"]:
+        # Version 3 is the plugin-era schema, which stores generic scorer
+        # `scores`/`baseline_scores`. It is intentionally NOT compatible with the
+        # pre-plugin v1/v2 schema (hardcoded refusals/KL `metrics`), so those are
+        # rejected rather than silently failing on a missing key later.
+        if reproduction_information["version"] != "3":
             print(
                 (
                     f"[red]Unsupported file format version: [bold]{reproduction_information['version']}[/].[/] "
-                    "Try loading the file with a newer version of Heretic."
+                    "This version of Heretic reads version 3 (plugin scorer) reproduce.json files. "
+                    "Older files were produced before the scorer-plugin refactor and are not supported. "
+                    "Please install Heretic 1.4 to use these files."
                 )
             )
             return
 
-        if not check_environment(reproduction_information):
+        if not check_environment(settings, reproduction_information):
             return
 
         print()
-
-        verify_hashes = reproduction_information["version"] != "1"
 
         settings = Settings.model_validate(reproduction_information["settings"])
 
     if settings.seed is None:
         settings.seed = random.randint(0, 2**32 - 1)
 
-    set_seed(settings.seed)
+    transformers.set_seed(settings.seed)
 
     print(get_accelerator_info())
+
+    if settings.print_debug_information:
+        print()
+        print(torch.__config__.show().strip())
+        print()
+        print(
+            f"torch.backends.mkldnn.enabled = [bold]{torch.backends.mkldnn.enabled}[/]"
+        )
+        print(f"torch.get_num_threads() = [bold]{torch.get_num_threads()}[/]")
+        print(
+            f"torch.get_num_interop_threads() = [bold]{torch.get_num_interop_threads()}[/]"
+        )
 
     # We don't need gradients as we only do inference.
     torch.set_grad_enabled(False)
@@ -320,15 +336,17 @@ def run():
         choices = []
 
         if existing_study.user_attrs["finished"]:
-            print()
-            print(
-                (
-                    "[green]You have already processed this model.[/] "
-                    "You can show the results from the previous run, allowing you to export models or to run additional trials. "
-                    "Alternatively, you can ignore the previous run and start from scratch. "
-                    "This will delete the checkpoint file and all results from the previous run."
+            if settings.checkpoint_action is None:
+                print()
+                print(
+                    (
+                        "[green]You have already processed this model.[/] "
+                        "You can show the results from the previous run, allowing you to export models or to run additional trials. "
+                        "Alternatively, you can ignore the previous run and start from scratch. "
+                        "This will delete the checkpoint file and all results from the previous run."
+                    )
                 )
-            )
+
             choices.append(
                 Choice(
                     title="Show the results from the previous run",
@@ -336,15 +354,17 @@ def run():
                 )
             )
         else:
-            print()
-            print(
-                (
-                    "[yellow]You have already processed this model, but the run was interrupted.[/] "
-                    "You can continue the previous run from where it stopped. This will override any specified settings. "
-                    "Alternatively, you can ignore the previous run and start from scratch. "
-                    "This will delete the checkpoint file and all results from the previous run."
+            if settings.checkpoint_action is None:
+                print()
+                print(
+                    (
+                        "[yellow]You have already processed this model, but the run was interrupted.[/] "
+                        "You can continue the previous run from where it stopped. This will override any specified settings. "
+                        "Alternatively, you can ignore the previous run and start from scratch. "
+                        "This will delete the checkpoint file and all results from the previous run."
+                    )
                 )
-            )
+
             choices.append(
                 Choice(
                     title="Continue the previous run",
@@ -366,19 +386,29 @@ def run():
             )
         )
 
-        print()
-        choice = prompt_select("How would you like to proceed?", choices)
+        if settings.checkpoint_action is None:
+            print()
 
-        if choice == "continue":
+        action = ask_if_unset(
+            settings.checkpoint_action,
+            questionary.select(
+                "How would you like to proceed?",
+                choices=choices,
+                style=Style([("highlighted", "reverse")]),
+            ),
+        )
+
+        if action is None or action == "":
+            return
+
+        if action == "continue":
             settings = Settings.model_validate_json(
                 existing_study.user_attrs["settings"]
             )
-        elif choice == "restart":
+        elif action == "restart":
             os.unlink(study_checkpoint_file)
             backend = JournalFileBackend(study_checkpoint_file, lock_obj=lock_obj)
             storage = JournalStorage(backend)
-        elif choice is None or choice == "":
-            return
 
     model = Model(settings)
     print()
@@ -449,40 +479,88 @@ def run():
         print()
         print("Checking for common response prefix...")
         prefix_check_prompts = good_prompts[:100] + bad_prompts[:100]
-        responses = model.get_responses_batched(prefix_check_prompts)
 
-        # Despite being located in os.path, commonprefix actually performs
-        # a naive string operation without any path-specific logic,
-        # which is exactly what we need here. Trailing spaces are removed
-        # to avoid issues where multiple different tokens that all start
-        # with a space character lead to the common prefix ending with
-        # a space, which would result in an uncommon tokenization.
-        settings.response_prefix = commonprefix(responses).rstrip(" ")
+        # Detect if the model's chat template inserts a reasoning tag on its own
+        # at the end of user's prompt (e.g. <think>) by using a dummy prompt.
+        # If found, then we use the full closed CoT as the response prefix.
+        # LiquidAI's LFM models do this (Lfm2ForCausalLM).
 
-        if settings.response_prefix:
-            print(f"* Prefix found: [bold]{settings.response_prefix!r}[/]")
+        # This cast is valid because str is the return type
+        # for a single chat operation with tokenize=False.
+        dummy_prompt = cast(
+            str,
+            model.tokenizer.apply_chat_template(
+                [{"role": "user", "content": "This is a dummy prompt."}],
+                add_generation_prompt=True,
+                tokenize=False,
+            ),
+        )
 
-            for cot_initializer, closed_cot_block in settings.chain_of_thought_skips:
-                if settings.response_prefix.startswith(cot_initializer):
-                    settings.response_prefix = closed_cot_block
-                    print(
-                        f"* Closed Chain-of-Thought block: [bold]{settings.response_prefix!r}[/]"
-                    )
+        cot_skip_applied = False
 
-                    # When using a Chain-of-Thought skip, we need to check that the prefix
-                    # is actually complete (e.g. not missing a trailing newline).
-                    print("* Rechecking with prefix...")
-                    responses = model.get_responses_batched(prefix_check_prompts)
-                    additional_prefix = commonprefix(responses).rstrip(" ")
-                    if additional_prefix:
-                        settings.response_prefix += additional_prefix
+        for cot_initializer, closed_cot_block in settings.chain_of_thought_skips:
+            # Match the tag and ignore any whitespace characters following it at the end
+            # (if any), including spaces, tabs, and linebreaks. This is required for models
+            # having whitespaces after the tags.
+            pattern = rf"{re.escape(cot_initializer)}\s*$"
+            match = re.search(pattern, dummy_prompt)
+
+            if match:
+                # We use only the closed CoT block here. Any whitespaces
+                # will be handled by the 'Rechecking with prefix' logic below.
+                settings.response_prefix = closed_cot_block
+                print(
+                    f"* Closed Chain-of-Thought block: [bold]{escape(repr(settings.response_prefix))}[/]"
+                )
+                cot_skip_applied = True
+                break
+
+        # Fallback to inference for models like mistral-3 which are specifically
+        # instructed to generate thinking tags using the system prompt in their
+        # chat template, instead of inserting a prefix tag (e.g. <think>) at
+        # the end of user prompt like the case above. We expect the model to
+        # generate those tags.
+        if settings.response_prefix is None:
+            responses = model.get_responses_batched(prefix_check_prompts)
+
+            # Despite being located in os.path, commonprefix actually performs
+            # a naive string operation without any path-specific logic,
+            # which is exactly what we need here. Trailing spaces are removed
+            # to avoid issues where multiple different tokens that all start
+            # with a space character lead to the common prefix ending with
+            # a space, which would result in an uncommon tokenization.
+            settings.response_prefix = commonprefix(responses).rstrip(" ")
+
+            if settings.response_prefix:
+                print(
+                    f"* Prefix found: [bold]{escape(repr(settings.response_prefix))}[/]"
+                )
+
+                for (
+                    cot_initializer,
+                    closed_cot_block,
+                ) in settings.chain_of_thought_skips:
+                    if settings.response_prefix.startswith(cot_initializer):
+                        settings.response_prefix = closed_cot_block
                         print(
-                            f"* Extended prefix found: [bold]{settings.response_prefix!r}[/]"
+                            f"* Closed Chain-of-Thought block: [bold]{escape(repr(settings.response_prefix))}[/]"
                         )
+                        cot_skip_applied = True
+                        break
+            else:
+                print("* None found")
 
-                    break
-        else:
-            print("* None found")
+        if cot_skip_applied:
+            # When using a Chain-of-Thought skip, we need to check that the prefix
+            # is actually complete (e.g. not missing a trailing newline).
+            print("* Rechecking with prefix...")
+            responses = model.get_responses_batched(prefix_check_prompts)
+            additional_prefix = commonprefix(responses).rstrip(" ")
+            if additional_prefix:
+                settings.response_prefix += additional_prefix
+                print(
+                    f"* Extended prefix found: [bold]{escape(repr(settings.response_prefix))}[/]"
+                )
 
     evaluator = Evaluator(settings, model)
 
@@ -492,11 +570,21 @@ def run():
         settings.model = settings.evaluate_model
         model.reset_model()
         print("* Evaluating...")
-        evaluator.get_score()
+        for name, score in evaluator.get_scores():
+            print(f"  * [bold]{name}:[/] [green]{score.rich_display}[/]")
+        return
+
+    if not reproduction_mode and not evaluator.get_objective_names():
+        print()
+        print(
+            "[red]No optimization objectives configured.[/] At least one scorer "
+            'must set [bold]optimization[/] to "maximize" or "minimize". '
+            "See [bold]config.default.toml[/] for details."
+        )
         return
 
     print()
-    print("Calculating per-layer refusal directions...")
+    print("Calculating per-layer residual directions...")
 
     needs_full_residuals = settings.print_residual_geometry or settings.plot_residuals
 
@@ -525,18 +613,18 @@ def run():
         print("* Obtaining residual mean for bad prompts...")
         bad_means = model.get_residuals_mean(bad_prompts)
 
-    refusal_directions = F.normalize(bad_means - good_means, p=2, dim=1)
+    residual_directions = F.normalize(bad_means - good_means, p=2, dim=1)
 
     if settings.orthogonalize_direction:
         # Implements https://huggingface.co/blog/grimjim/projected-abliteration
-        # Adjust the refusal directions so that only the component that is
+        # Adjust the residual directions so that only the component that is
         # orthogonal to the good direction is subtracted during abliteration.
         good_directions = F.normalize(good_means, p=2, dim=1)
-        projection_vector = torch.sum(refusal_directions * good_directions, dim=1)
-        refusal_directions = (
-            refusal_directions - projection_vector.unsqueeze(1) * good_directions
+        projection_vector = torch.sum(residual_directions * good_directions, dim=1)
+        residual_directions = (
+            residual_directions - projection_vector.unsqueeze(1) * good_directions
         )
-        refusal_directions = F.normalize(refusal_directions, p=2, dim=1)
+        residual_directions = F.normalize(residual_directions, p=2, dim=1)
         del good_directions, projection_vector
 
     del good_means, bad_means
@@ -549,7 +637,7 @@ def run():
     start_index = 0
     start_time = time.perf_counter()
 
-    def objective(trial: Trial) -> tuple[float, float]:
+    def objective(trial: Trial) -> tuple[float, ...]:
         nonlocal trial_index
         trial_index += 1
         trial.set_user_attr("index", trial_index)
@@ -619,7 +707,7 @@ def run():
             min_weight_distance = trial.suggest_float(
                 f"{component}.min_weight_distance",
                 1.0,
-                0.6 * last_layer_index,
+                max(0.6 * last_layer_index, 1.0),
             )
 
             parameters[component] = AbliterationParameters(
@@ -634,7 +722,7 @@ def run():
 
         print()
         print(
-            f"Running trial [bold]{trial_index}[/] of [bold]{settings.n_trials}[/]..."
+            f"[magenta]Running trial [bold]{trial_index}[/] of [bold]{settings.n_trials}[/]...[/]"
         )
         print("* Parameters:")
         for name, value in get_trial_parameters(trial).items():
@@ -642,9 +730,12 @@ def run():
         print("* Resetting model...")
         model.reset_model()
         print("* Abliterating...")
-        model.abliterate(refusal_directions, direction_index, parameters)
+        model.abliterate(residual_directions, direction_index, parameters)
         print("* Evaluating...")
-        score, kl_divergence, refusals = evaluator.get_score()
+        scores = evaluator.get_scores()
+        objective_values = evaluator.get_objective_values(scores)
+        for name, score in scores:
+            print(f"  * [bold]{name}:[/] [green]{score.rich_display}[/]")
 
         elapsed_time = time.perf_counter() - start_time
         remaining_time = (elapsed_time / (trial_index - start_index)) * (
@@ -656,22 +747,25 @@ def run():
             print(
                 f"[grey50]Estimated remaining time: [bold]{format_duration(remaining_time)}[/][/]"
             )
+        trial.set_user_attr(
+            "scores",
+            evaluator.get_paired_score_records(scores),
+        )
         print_memory_usage()
 
-        trial.set_user_attr("kl_divergence", kl_divergence)
-        trial.set_user_attr("refusals", refusals)
-        trial.set_user_attr("base_refusals", evaluator.base_refusals)
-        trial.set_user_attr("n_bad_prompts", len(evaluator.bad_prompts))
+        return objective_values
 
-        return score
-
-    def objective_wrapper(trial: Trial) -> tuple[float, float]:
+    def objective_wrapper(trial: Trial) -> tuple[float, ...]:
         try:
             return objective(trial)
         except KeyboardInterrupt:
             # Stop the study gracefully on Ctrl+C.
             trial.study.stop()
             raise TrialPruned()
+
+    # Derive objective info from the configured scorers.
+    objective_names = evaluator.get_objective_names()
+    directions = evaluator.get_objective_directions()
 
     if not reproduction_mode:
         study = optuna.create_study(
@@ -681,8 +775,8 @@ def run():
                 multivariate=True,
                 seed=settings.seed,
             ),
-            directions=[StudyDirection.MINIMIZE, StudyDirection.MINIMIZE],
             storage=storage,
+            directions=directions,
             study_name="heretic",
             load_if_exists=True,
         )
@@ -709,7 +803,9 @@ def run():
         if len(study.trials) == settings.n_trials:
             study.set_user_attr("finished", True)
 
-    while True:
+    trial_loop_active = True
+
+    while trial_loop_active:
         if not reproduction_mode:
             # If no trials at all have been evaluated, the study must have been stopped
             # by pressing Ctrl+C while the first trial was running. In this case, we just
@@ -720,34 +816,38 @@ def run():
             if not completed_trials:
                 raise KeyboardInterrupt
 
-            # Get the Pareto front of trials. We can't use study.best_trials directly
-            # as get_score() doesn't return the pure KL divergence and refusal count.
-            # Note: Unlike study.best_trials, this does not handle objective constraints.
+            # Best trials isn't sorted, so sort by all the scores in non-decreasing order.
             sorted_trials = sorted(
-                completed_trials,
-                key=lambda trial: (
-                    trial.user_attrs["refusals"],
-                    trial.user_attrs["kl_divergence"],
+                study.best_trials,
+                key=lambda trial: tuple(
+                    next(
+                        (
+                            score["score"]["value"]
+                            for score in trial.user_attrs["scores"]
+                            if score["name"] == name
+                        ),
+                        None,
+                    )
+                    for name in objective_names
                 ),
             )
-            min_divergence = math.inf
-            best_trials = []
-            for trial in sorted_trials:
-                kl_divergence = trial.user_attrs["kl_divergence"]
-                if kl_divergence < min_divergence:
-                    min_divergence = kl_divergence
-                    best_trials.append(trial)
+
+            def format_trial_title(trial: FrozenTrial) -> str:
+                prefix = f"[Trial {trial.user_attrs['index']:>3}]"
+
+                # We don't directly use the trial.values here since we need to show the
+                # CLI-formatted versions, which are stored in the trial's user attributes.
+                score_parts: list[str] = []
+                for score in trial.user_attrs["scores"]:
+                    name = score["name"]
+                    value = Text.from_markup(score["score"]["rich_display"]).plain
+                    score_parts.append(f"{name}: {value}")
+
+                return f"{prefix} " + ", ".join(score_parts)
 
             choices = [
-                Choice(
-                    title=(
-                        f"[Trial {trial.user_attrs['index']:>3}] "
-                        f"Refusals: {trial.user_attrs['refusals']:>2}/{len(evaluator.bad_prompts)}, "
-                        f"KL divergence: {trial.user_attrs['kl_divergence']:.4f}"
-                    ),
-                    value=trial,
-                )
-                for trial in best_trials
+                Choice(title=format_trial_title(trial), value=trial)
+                for trial in sorted_trials
             ]
 
             choices.append(
@@ -766,39 +866,51 @@ def run():
 
             print()
             print("[bold green]Optimization finished![/]")
-            print()
-            print(
-                (
-                    "The following trials resulted in Pareto optimal combinations of refusals and KL divergence. "
-                    "After selecting a trial, you will be able to save the model, upload it to Hugging Face, "
-                    "chat with it to test how well it works, or run standard benchmarks on it. "
-                    "You can return to this menu later to select a different trial. "
-                    "[yellow]Note that KL divergence values above 0.5 usually indicate significant damage to the original model's capabilities.[/]"
-                )
-            )
 
-        while True:
+            if settings.trial_index is None:
+                print()
+                print(
+                    (
+                        "The following trials resulted in Pareto optimal combinations of the optimization objectives. "
+                        "After selecting a trial, you will be able to save the model, upload it to Hugging Face, "
+                        "chat with it to test how well it works, or run standard benchmarks on it. "
+                        "You can return to this menu later to select a different trial. "
+                    )
+                )
+
+        while trial_loop_active:
+            # Ensure a predefined trial is only processed once.
+            if settings.trial_index is not None:
+                trial_loop_active = False
+
             if reproduction_mode:
                 parameters = reproduction_information["parameters"]
-                metrics = reproduction_information["metrics"]
 
                 trial = create_trial(
                     values=[],
                     user_attrs={
                         "direction_index": parameters["direction_index"],
                         "parameters": parameters["abliteration_parameters"],
-                        "kl_divergence": metrics["kl_divergence"],
-                        "refusals": metrics["refusals"],
-                        "base_refusals": metrics["base_refusals"],
-                        "n_bad_prompts": metrics["n_bad_prompts"],
+                        "scores": reproduction_information["scores"],
                     },
                 )
 
                 print()
                 print("Restoring model from reproduction information...")
             else:
-                print()
-                trial = prompt_select("Which trial do you want to use?", choices)
+                if settings.trial_index is None:
+                    print()
+
+                trial = ask_if_unset(
+                    None
+                    if settings.trial_index is None
+                    else sorted_trials[settings.trial_index],
+                    questionary.select(
+                        "Which trial do you want to use?",
+                        choices=choices,
+                        style=Style([("highlighted", "reverse")]),
+                    ),
+                )
 
                 if trial is None or trial == "":
                     return
@@ -806,8 +918,11 @@ def run():
                 if trial == "continue":
                     while True:
                         try:
-                            n_additional_trials = prompt_text(
-                                "How many additional trials do you want to run?"
+                            n_additional_trials = ask_if_unset(
+                                settings.n_additional_trials,
+                                questionary.text(
+                                    "How many additional trials do you want to run?"
+                                ),
                             )
                             if n_additional_trials is None or n_additional_trials == "":
                                 n_additional_trials = 0
@@ -856,7 +971,7 @@ def run():
                 model.reset_model()
                 print("* Abliterating...")
                 model.abliterate(
-                    refusal_directions,
+                    residual_directions,
                     trial.user_attrs["direction_index"],
                     {
                         k: AbliterationParameters(**v)
@@ -866,22 +981,46 @@ def run():
 
             reset_trial_model()
 
-            while True:
-                print()
-                action = prompt_select(
-                    "What do you want to do with the decensored model?",
-                    [
-                        "Save the model to a local folder",
-                        "Upload the model to Hugging Face",
-                        "Chat with the model",
-                        "Benchmark the model",
-                        Choice(
-                            title="Exit program"
-                            if reproduction_mode
-                            else "Return to the trial selection menu",
-                            value="",
-                        ),
-                    ],
+            action_loop_active = True
+
+            while action_loop_active:
+                # Ensure a predefined action is only executed once.
+                if settings.model_action is not None:
+                    action_loop_active = False
+
+                if settings.model_action is None:
+                    print()
+
+                action = ask_if_unset(
+                    settings.model_action,
+                    questionary.select(
+                        "What do you want to do with the decensored model?",
+                        choices=[
+                            Choice(
+                                title="Save the model to a local folder",
+                                value="save",
+                            ),
+                            Choice(
+                                title="Upload the model to Hugging Face",
+                                value="upload",
+                            ),
+                            Choice(
+                                title="Chat with the model",
+                                value="chat",
+                            ),
+                            Choice(
+                                title="Benchmark the model",
+                                value="benchmark",
+                            ),
+                            Choice(
+                                title="Exit program"
+                                if reproduction_mode
+                                else "Return to the trial selection menu",
+                                value="",
+                            ),
+                        ],
+                        style=Style([("highlighted", "reverse")]),
+                    ),
                 )
 
                 if action is None or action == "":
@@ -895,8 +1034,14 @@ def run():
                 # the optimized model.
                 try:
                     match action:
-                        case "Save the model to a local folder":
-                            save_directory = prompt_path("Path to the folder:")
+                        case "save":
+                            save_directory = ask_if_unset(
+                                settings.save_directory,
+                                questionary.path(
+                                    "Path to the folder:",
+                                    only_directories=True,
+                                ),
+                            )
                             if not save_directory:
                                 continue
 
@@ -926,7 +1071,7 @@ def run():
 
                             print(f"Model saved to [bold]{save_directory}[/].")
 
-                            if reproduction_mode and verify_hashes:
+                            if reproduction_mode:
                                 print("Verifying hashes of weight files...")
 
                                 for (
@@ -951,13 +1096,20 @@ def run():
                                             f"[bold]{filename}:[/] [red]File not found[/]"
                                         )
 
-                        case "Upload the model to Hugging Face":
+                        case "upload":
                             # We don't use huggingface_hub.login() because that stores the token on disk,
                             # and since this program will often be run on rented or shared GPU servers,
                             # it's better to not persist credentials.
                             token = huggingface_hub.get_token()
                             if not token:
-                                token = prompt_password("Hugging Face access token:")
+                                # NOTE: Unlike for most other values obtained from interactive inputs, it is
+                                #       not possible to set the token via the settings. This is a security
+                                #       precaution to prevent exporting the token under all circumstances.
+                                #       For scripting, the correct way to set the token is through the HF_TOKEN
+                                #       environment variable, or through the HF token file.
+                                token = questionary.password(
+                                    "Hugging Face access token:"
+                                ).ask()
                             if not token:
                                 continue
 
@@ -969,17 +1121,32 @@ def run():
                             email = user.get("email", "no email found")
                             print(f"Logged in as [bold]{fullname} ({email})[/]")
 
-                            repo_id = prompt_text(
-                                "Name of repository:",
-                                default=f"{user['name']}/{Path(settings.model).name}-heretic",
+                            repo_id = ask_if_unset(
+                                settings.upload_repo_id,
+                                questionary.text(
+                                    "Name of repository:",
+                                    default=f"{user['name']}/{Path(settings.model).name}-heretic",
+                                ),
                             )
+                            if not repo_id:
+                                continue
 
-                            visibility = prompt_select(
-                                "Should the repository be public or private?",
-                                [
-                                    "Public",
-                                    "Private",
-                                ],
+                            visibility = ask_if_unset(
+                                None
+                                if settings.upload_repo_private is None
+                                else (
+                                    "Private"
+                                    if settings.upload_repo_private
+                                    else "Public"
+                                ),
+                                questionary.select(
+                                    "Should the repository be public or private?",
+                                    choices=[
+                                        "Public",
+                                        "Private",
+                                    ],
+                                    style=Style([("highlighted", "reverse")]),
+                                ),
                             )
                             if visibility is None:
                                 continue
@@ -990,45 +1157,60 @@ def run():
                                 continue
 
                             # Reproducibility requires that the model and all datasets
-                            # are available on the Hugging Face Hub (not local paths).
-                            datasets = [
-                                settings.good_prompts.dataset,
-                                settings.bad_prompts.dataset,
-                                settings.good_evaluation_prompts.dataset,
-                                settings.bad_evaluation_prompts.dataset,
+                            # are available on the Hugging Face Hub (not local paths),
+                            # that all datasets are pinned to a commit (an unpinned
+                            # dataset was likely loaded from a local cache), and that
+                            # only built-in scorer plugins are used (external plugins
+                            # cannot be resolved when reproducing).
+                            dataset_specifications = [
+                                settings.good_prompts,
+                                settings.bad_prompts,
+                                *evaluator.get_dataset_specifications(),
                             ]
                             is_reproducible = (
                                 is_hf_path(settings.model)
-                                and all(is_hf_path(dataset) for dataset in datasets)
+                                and all(
+                                    is_hf_path(specification.dataset)
+                                    and specification.commit is not None
+                                    for specification in dataset_specifications
+                                )
+                                and evaluator.all_scorers_reproducible()
+                                and evaluator.all_scorers_builtin()
                                 and not reproduction_mode
                             )
 
                             if is_reproducible:
-                                print(
-                                    (
-                                        "Heretic can add information to the repository that allows others to reproduce the model. "
-                                        "This is optional, but valuable to the community as both a learning tool and to preserve computational work already done. "
-                                        "Guaranteeing reproducibility requires basic system information (Python and OS version, CPU and GPU/accelerator info) "
-                                        "as tensor operations can give different results in different system environments. "
-                                        "[bold]The information does not include any file system paths or other private data.[/]"
+                                if settings.upload_reproducibility_information is None:
+                                    print(
+                                        (
+                                            "Heretic can add information to the repository that allows others to reproduce the model. "
+                                            "This is optional, but valuable to the community as both a learning tool and to preserve computational work already done. "
+                                            "Guaranteeing reproducibility requires basic system information (Python and OS version, CPU and GPU/accelerator info) "
+                                            "as tensor operations can give different results in different system environments. "
+                                            "[bold]The information does not include any file system paths or other private data.[/]"
+                                        )
                                     )
-                                )
-                                reproducibility_information = prompt_select(
-                                    "Which reproducibility information do you want to add?",
-                                    [
-                                        Choice(
-                                            title="Full: Settings, package versions, and system information",
-                                            value="full",
-                                        ),
-                                        Choice(
-                                            title="Basic: Settings and package versions",
-                                            value="basic",
-                                        ),
-                                        Choice(
-                                            title="Don't add any reproducibility information",
-                                            value="none",
-                                        ),
-                                    ],
+
+                                reproducibility_information = ask_if_unset(
+                                    settings.upload_reproducibility_information,
+                                    questionary.select(
+                                        "Which reproducibility information do you want to add?",
+                                        choices=[
+                                            Choice(
+                                                title="Full: Settings, package versions, and system information",
+                                                value="full",
+                                            ),
+                                            Choice(
+                                                title="Basic: Settings and package versions",
+                                                value="basic",
+                                            ),
+                                            Choice(
+                                                title="Don't add any reproducibility information",
+                                                value="none",
+                                            ),
+                                        ],
+                                        style=Style([("highlighted", "reverse")]),
+                                    ),
                                 )
                                 if reproducibility_information is None:
                                     continue
@@ -1123,7 +1305,7 @@ def run():
 
                             print(f"Model uploaded to [bold]{repo_id}[/].")
 
-                            if reproduction_mode and verify_hashes:
+                            if reproduction_mode:
                                 print("Verifying hashes of weight files...")
 
                                 api = HfApi()
@@ -1174,7 +1356,7 @@ def run():
                                             f"[bold]{filename}:[/] [red]File not found[/]"
                                         )
 
-                        case "Chat with the model":
+                        case "chat":
                             print()
                             print(
                                 "[cyan]Press Ctrl+C at any time to return to the menu.[/]"
@@ -1186,11 +1368,10 @@ def run():
 
                             while True:
                                 try:
-                                    message = prompt_text(
+                                    message = questionary.text(
                                         "User:",
                                         qmark=">",
-                                        unsafe=True,
-                                    )
+                                    ).unsafe_ask()
                                     if not message:
                                         break
                                     chat.append({"role": "user", "content": message})
@@ -1204,7 +1385,7 @@ def run():
                                     # Ctrl+C/Ctrl+D
                                     break
 
-                        case "Benchmark the model":
+                        case "benchmark":
                             benchmarks = questionary.checkbox(
                                 "Which benchmarks do you want to run?",
                                 [
@@ -1219,16 +1400,17 @@ def run():
                             if not benchmarks:
                                 continue
 
-                            scope = prompt_select(
+                            scope = questionary.select(
                                 (
                                     "Do you want to benchmark the original model along with the decensored model? "
                                     "Benchmarking both models allows you to compare the scores, but it takes twice as much time."
                                 ),
-                                [
+                                choices=[
                                     "Benchmark only the decensored model",
                                     "Benchmark both models",
                                 ],
-                            )
+                                style=Style([("highlighted", "reverse")]),
+                            ).ask()
                             if scope is None:
                                 continue
                             benchmark_original_model = scope == "Benchmark both models"

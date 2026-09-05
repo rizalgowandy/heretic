@@ -1,12 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
-import getpass
 import hashlib
 import json
 import os
 import platform
-import random
 import tempfile
 import traceback
 from dataclasses import dataclass
@@ -16,8 +14,6 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 import huggingface_hub
-import numpy as np
-import questionary
 import tomli_w
 import torch
 from datasets import DatasetDict, ReadInstruction, load_dataset, load_from_disk
@@ -26,9 +22,10 @@ from datasets.download.download_manager import DownloadMode
 from datasets.utils.info_utils import VerificationMode
 from huggingface_hub.utils import validate_repo_id
 from optuna import Trial
+from optuna.study import StudyDirection
 from optuna.trial import FrozenTrial
 from psutil import Process
-from questionary import Choice, Style
+from questionary import Question
 from rich.console import Console
 
 from .config import DatasetSpecification, Settings
@@ -41,7 +38,37 @@ from .system import (
     is_xpu_available,
 )
 
+T = TypeVar("T")
+
+
 print = Console(highlight=False).print
+
+T = TypeVar("T")
+
+
+def deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """
+    Recursively merge two dicts.
+
+    Values from `override` take precedence. Nested dicts are merged recursively.
+    """
+    merged: dict[str, Any] = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = deep_merge_dicts(merged[key], value)  # type: ignore[arg-type]
+        else:
+            merged[key] = value
+    return merged
+
+
+def parse_study_direction(optimization: str) -> StudyDirection:
+    """
+    Converts the optimization value stored as a `str` to the
+    `StudyDirection` object required by Optuna.
+    """
+    if optimization == "none":
+        return StudyDirection.NOT_SET
+    return StudyDirection[optimization.upper()]
 
 
 def print_memory_usage():
@@ -65,99 +92,6 @@ def print_memory_usage():
     elif torch.backends.mps.is_available():
         p("Allocated MPS memory", torch.mps.current_allocated_memory())
         p("Driver (reserved) MPS memory", torch.mps.driver_allocated_memory())
-
-
-def is_notebook() -> bool:
-    # Check for specific environment variables (Colab, Kaggle).
-    # This is necessary because when running as a subprocess (e.g. !heretic),
-    # get_ipython() might not be available or might not reflect the notebook environment.
-    if os.getenv("COLAB_GPU") or os.getenv("KAGGLE_KERNEL_RUN_TYPE"):
-        return True
-
-    # Check IPython shell type (for library usage).
-    try:
-        from IPython import get_ipython  # ty:ignore[unresolved-import]
-
-        shell = get_ipython()
-        if shell is None:
-            return False
-
-        shell_name = shell.__class__.__name__
-        if shell_name in ["ZMQInteractiveShell", "Shell"]:
-            return True
-
-        if "google.colab" in str(shell.__class__):
-            return True
-
-        return False
-    except (ImportError, NameError, AttributeError):
-        return False
-
-
-def prompt_select(message: str, choices: list[Any]) -> Any:
-    if is_notebook():
-        print()
-        print(message)
-        real_choices = []
-
-        for i, choice in enumerate(choices, 1):
-            if isinstance(choice, Choice):
-                print(f"[{i}] {choice.title}")
-                real_choices.append(choice.value)
-            else:
-                print(f"[{i}] {choice}")
-                real_choices.append(choice)
-
-        while True:
-            try:
-                selection = input("Enter number: ")
-                index = int(selection) - 1
-                if 0 <= index < len(real_choices):
-                    return real_choices[index]
-                print(
-                    f"[red]Please enter a number between 1 and {len(real_choices)}[/]"
-                )
-            except ValueError:
-                print("[red]Invalid input. Please enter a number.[/]")
-    else:
-        return questionary.select(
-            message,
-            choices=choices,
-            style=Style([("highlighted", "reverse")]),
-        ).ask()
-
-
-def prompt_text(
-    message: str,
-    default: str = "",
-    qmark: str = "?",
-    unsafe: bool = False,
-) -> str:
-    if is_notebook():
-        print()
-        result = input(f"{message} [{default}]: " if default else f"{message}: ")
-        return result if result else default
-    else:
-        question = questionary.text(message, default=default, qmark=qmark)
-        if unsafe:
-            return question.unsafe_ask()
-        else:
-            return question.ask()
-
-
-def prompt_path(message: str) -> str:
-    if is_notebook():
-        return prompt_text(message)
-    else:
-        return questionary.path(message, only_directories=True).ask()
-
-
-def prompt_password(message: str) -> str:
-    if is_notebook():
-        print()
-        return getpass.getpass(message)
-    else:
-        return questionary.password(message).ask()
 
 
 def format_duration(seconds: float) -> str:
@@ -184,6 +118,16 @@ def format_exception(error: Exception) -> str:
 
     # If there is no message in the entire causal chain, fall back to the complete traceback.
     return traceback.format_exc().strip()
+
+
+def ask_if_unset(value: T, question: Question, unsafe: bool = False) -> T:
+    if value is None:
+        if unsafe:
+            return question.unsafe_ask()
+        else:
+            return question.ask()
+    else:
+        return value
 
 
 def is_hf_path(path: str) -> bool:
@@ -248,8 +192,23 @@ def load_prompts(
             raise ValueError(f'The "column" field is required for datasets: {path}')
 
         if is_hf_path(path):
+            # Pin to the latest commit if not already set, so the exact dataset
+            # version is recorded for reproducibility.
+            if specification.commit is None:
+                try:
+                    specification.commit = huggingface_hub.dataset_info(path).sha
+                except Exception as error:
+                    # Fetching the commit hash requires internet access, but the
+                    # dataset itself may be fully cached locally. Proceed without
+                    # pinning; an unpinned dataset disables the reproducibility
+                    # offer during upload.
+                    print(
+                        f"[yellow]Warning: Could not fetch the latest commit hash for dataset [bold]{path}[/] ({error}). "
+                        "The dataset version will not be pinned.[/]"
+                    )
             dataset = load_dataset(
                 path,
+                name=specification.config,
                 revision=specification.commit,
                 split=split_str,
             )
@@ -267,6 +226,7 @@ def load_prompts(
             # Path should be a local directory.
             dataset = load_dataset(
                 path,
+                name=specification.config,
                 split=split_str,
                 # Don't require the number of examples (lines) per split to be pre-defined.
                 verification_mode=VerificationMode.NO_CHECKS,
@@ -295,9 +255,6 @@ def load_prompts(
         )
         for prompt in prompts
     ]
-
-
-T = TypeVar("T")
 
 
 def batchify(items: list[T], batch_size: int) -> list[list[T]]:
@@ -330,6 +287,25 @@ def get_readme_intro(
         # Hide the path, which may contain private information.
         model_link = "a model"
 
+    scores_raw = trial.user_attrs["scores"]
+    scores_by_name: dict[str, dict[str, Any]] = {}
+    score_names: list[str] = []
+    for score in scores_raw:
+        name = score["name"]
+        scores_by_name[name] = score
+        score_names.append(name)
+
+    score_rows = "\n".join(
+        [
+            (
+                f"| **{name}** | "
+                f"{scores_by_name[name]['score']['md_display']} | "
+                f"{scores_by_name[name]['baseline']['md_display']} |"
+            )
+            for name in score_names
+        ]
+    )
+
     if contains_reproducibility_information:
         reproducibility_instructions = """
 > [!TIP]
@@ -361,10 +337,7 @@ def get_readme_intro(
 
 | Metric | This model | Original model ({model_link}) |
 | :----- | :--------: | :---------------------------: |
-| **KL divergence** | {trial.user_attrs["kl_divergence"]:.4f} | 0 *(by definition)* |
-| **Refusals** | {trial.user_attrs["refusals"]}/{trial.user_attrs["n_bad_prompts"]} | {
-        trial.user_attrs["base_refusals"]
-    }/{trial.user_attrs["n_bad_prompts"]} |
+{score_rows}
 
 -----
 
@@ -384,14 +357,6 @@ def generate_requirements_txt() -> str:
         f"{package}=={version}" for package, version in get_requirements_dict().items()
     ]
     return "\n".join(requirements) + "\n"
-
-
-def set_seed(seed: int):
-    """Sets the seed for all RNGs."""
-
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
 
 
 def format_hf_link(
@@ -528,6 +493,15 @@ def generate_reproduce_readme(
                 f" --index-url https://download.pytorch.org/whl/{suffix}"
             )
 
+    trial_scores = trial.user_attrs["scores"]
+    score_lines = "\n".join(
+        (
+            f"- **{score['name']}:** {score['score']['md_display']}"
+            f" (baseline: {score['baseline']['md_display']})"
+        )
+        for score in trial_scores
+    )
+
     return f"""# Reproduction guide
 
 This directory contains the necessary information and assets to reproduce the results obtained during this Heretic run.{heterogeneous_warning}{origin_warning}
@@ -540,14 +514,11 @@ This directory contains the necessary information and assets to reproduce the re
 
 - **Good prompts:** {format_hf_link(settings.good_prompts.dataset, settings.good_prompts.commit, is_dataset=True)}
 - **Bad prompts:** {format_hf_link(settings.bad_prompts.dataset, settings.bad_prompts.commit, is_dataset=True)}
-- **Good evaluation prompts:** {format_hf_link(settings.good_evaluation_prompts.dataset, settings.good_evaluation_prompts.commit, is_dataset=True)}
-- **Bad evaluation prompts:** {format_hf_link(settings.bad_evaluation_prompts.dataset, settings.bad_evaluation_prompts.commit, is_dataset=True)}
 
 ## Selected trial
 
 - **Trial number:** {trial.user_attrs["index"]}
-- **KL divergence:** {trial.user_attrs["kl_divergence"]:.6f}
-- **Refusals:** {trial.user_attrs["refusals"]}/{trial.user_attrs["n_bad_prompts"]}
+{score_lines}
 
 {system_report}## Environment
 
@@ -597,7 +568,8 @@ def generate_reproduce_json(
     version_info = get_heretic_version_info()
 
     data = {
-        "version": "2",  # Version number of the reproduce.json file format, to allow for future changes.
+        # Version 3: plugin-based schema with generic scores/baseline scores.
+        "version": "3",
         "timestamp": timestamp,
         "system": None,  # Defined here to preserve insertion order.
         "environment": {
@@ -614,12 +586,7 @@ def generate_reproduce_json(
             "direction_index": trial.user_attrs["direction_index"],
             "abliteration_parameters": trial.user_attrs["parameters"],
         },
-        "metrics": {
-            "kl_divergence": trial.user_attrs["kl_divergence"],
-            "refusals": trial.user_attrs["refusals"],
-            "base_refusals": trial.user_attrs["base_refusals"],
-            "n_bad_prompts": trial.user_attrs["n_bad_prompts"],
-        },
+        "scores": trial.user_attrs["scores"],
         "hashes": uploaded_model_hashes,
     }
 
@@ -678,15 +645,6 @@ def create_reproduce_folder(
 
     # Fetch commit hash for the base model.
     settings.model_commit = huggingface_hub.model_info(settings.model).sha
-
-    # Fetch commit hashes for all HF datasets to ensure reproducibility.
-    for spec in [
-        settings.good_prompts,
-        settings.bad_prompts,
-        settings.good_evaluation_prompts,
-        settings.bad_evaluation_prompts,
-    ]:
-        spec.commit = huggingface_hub.dataset_info(spec.dataset).sha
 
     # Strip microseconds and timezone for a clean format.
     timestamp = (
